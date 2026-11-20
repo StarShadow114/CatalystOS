@@ -1,0 +1,336 @@
+#===============================================================================
+#  1. 工具链
+#===============================================================================
+TARGET   ?= aarch64-unknown-none
+CROSS    ?=                     # 预留: 交叉编译时设 llvm- 或 aarch64-linux-gnu-
+
+CC       := $(CROSS)clang
+LD       := $(CROSS)ld.lld
+OBJCOPY  := $(CROSS)llvm-objcopy
+OBJDUMP  := $(CROSS)llvm-objdump
+READELF  := $(CROSS)llvm-readelf
+NM       := $(CROSS)llvm-nm
+SIZE     := $(CROSS)llvm-size
+QEMU     ?= qemu-system-aarch64
+
+# -- 工具存在性预检 (只警告, 不断构建, 留到 doctor 详查) --
+TOOLS := $(CC) $(LD) $(OBJCOPY) $(OBJDUMP) $(READELF) $(NM)
+#===============================================================================
+#  2. 目录布局
+#===============================================================================
+BUILD    ?= build
+ELF      := $(BUILD)/catalyst.elf
+BIN      := $(BUILD)/catalyst.bin
+MAP      := $(BUILD)/catalyst.map
+LINKER   := arch/aarch64/linker.ld
+
+SRC_DIRS_C ?= kernel
+SRC_DIRS_S ?= arch/aarch64
+INC_DIRS   ?= include
+#===============================================================================
+#  3. 输出美化 — Kbuild 风格
+#     默认:
+#       CC      kernel/kernel.c
+#       LD      catalyst.elf
+#     V=1:
+#       clang --target=... -c -o build/... kernel/kernel.c
+#===============================================================================
+ifeq ($(V),1)
+  Q :=
+  VECHO := @true
+else
+  Q := @
+  VECHO := @echo
+endif
+
+# -- 颜色: 非 TTY 或无 NO_COLOR 时自动关闭 --
+ifeq ($(NO_COLOR),)
+  ifneq ($(MAKE_TERMOUT),)
+    C_R := \033[31m;  C_G := \033[32m;  C_Y := \033[33m
+    C_B := \033[34m;  C_M := \033[35m;  C_C := \033[36m
+    C_D := \033[90m;  C_0 := \033[0m;   BOLD := \033[1m
+  endif
+endif
+
+# -- 动词标签 (Kbuild 的 quiet_cmd_*) --
+act_CC   = $(VECHO)  "$(C_G)$(BOLD)  CC     $(C_0)$(subst $(BUILD)/,,$@)"
+act_AS   = $(VECHO)  "$(C_M)$(BOLD)  AS     $(C_0)$(subst $(BUILD)/,,$@)"
+act_LD   = $(VECHO)  "$(C_B)$(BOLD)  LD     $(C_0)$@"
+act_GEN  = $(VECHO)  "$(C_C)$(BOLD)  GEN    $(C_0)$@"
+act_QEMU = $(VECHO)  "$(C_Y)$(BOLD) QEMU    $(C_0)"
+#===============================================================================
+#  4. 源文件自动发现
+#     Linux 用 obj-y += foo.o 手工列表 (因为要支持 =m 模块化)
+#     我们不做模块, 所以直接 find 更省心
+#===============================================================================
+SRCS_C := $(foreach d,$(SRC_DIRS_C),$(shell find $(d) -name '*.c'  2>/dev/null | sort))
+SRCS_S := $(foreach d,$(SRC_DIRS_S),$(shell find $(d) -name '*.S'  2>/dev/null | sort))
+SRCS   := $(SRCS_S) $(SRCS_C)
+OBJS   := $(patsubst %,$(BUILD)/%.o,$(SRCS))
+DEPS   := $(OBJS:.o=.d)
+
+# -- 排除清单 (临时禁用的文件放这儿) --
+EXCLUDE ?=
+OBJS    := $(filter-out $(patsubst %,$(BUILD)/%.o,$(EXCLUDE)),$(OBJS))
+#===============================================================================
+#  5. 编译参数 — 分层, 便于 make CFLAGS=... 追加
+#===============================================================================
+WARN := -Wall -Wextra -Werror \
+        -Wshadow -Wstrict-prototypes -Wmissing-prototypes \
+        -Wundef -Wcast-align -Wwrite-strings \
+        -Wmissing-declarations -Wredundant-decls \
+        -Wconstant-logical-operand -Wtautological-constant-compare \
+        -Wmisleading-indentation -Wdouble-promotion
+
+CFLAGS_BASE := --target=$(TARGET) \
+               -ffreestanding -nostdlib -fno-builtin \
+               -O2 -g \
+               -I$(INC_DIRS) \
+               $(WARN)
+
+CFLAGS      ?= $(CFLAGS_BASE)
+ASFLAGS     ?= --target=$(TARGET) -g -I$(INC_DIRS)
+LDFLAGS     ?= -T $(LINKER) --error-unresolved-symbols -Map=$(MAP)
+QEMUFLAGS   ?= -machine virt -cpu cortex-a72 -nographic -kernel
+#===============================================================================
+#  6. 构建规则
+#===============================================================================
+.PHONY: all
+all: $(ELF)
+	@printf "$(C_G)$(BOLD)✓ catalyst.elf 已合成$(C_0)  $(C_D)($$(stat -c %s $(ELF)) 字节)$(C_0)\n"
+	@printf "$(C_D)  check → 验尸   run → 点火   size → 体积报告$(C_0)\n"
+
+# ---- 链接 ----
+$(ELF): $(OBJS) $(LINKER)
+	$(call act_LD)
+	$(Q)rm -f $@
+	$(Q)$(LD) $(LDFLAGS) -o $@ $(filter %.o,$^) 2>$(BUILD)/.ld.log; \
+	if [ -s $(BUILD)/.ld.log ]; then \
+	    printf "$(C_R)$(BOLD)  ✗ 链接失败$(C_0)\n"; \
+	    sed 's/^/    /' $(BUILD)/.ld.log; \
+	    printf "$(C_Y)  诊断:$(C_0)\n"; \
+	    if grep -qi 'undefined.*symbol\|unresolved' $(BUILD)/.ld.log; then \
+	        s=$$(grep -oE "(undefined symbol|undefined reference to)[^:]*: *[A-Za-z0-9_]+" $(BUILD)/.ld.log | head -1 | awk '{print $$NF}'); \
+	        printf "$(C_Y)    · 未解析符号 '%s'$(C_0)\n" "$$s"; \
+	        printf "$(C_Y)      → 拼错? 实现文件没被 find 扫到? 试 make why$(C_0)\n"; \
+	    fi; \
+	    if grep -qi 'not aligned' $(BUILD)/.ld.log; then \
+	        printf "$(C_Y)    · 段对齐冲突 → linker.ld 里 .text.boot 是否 KEEP 且排第一?$(C_0)\n"; \
+	    fi; \
+	    if grep -qiE 'overflow|region .* full|out of memory' $(BUILD)/.ld.log; then \
+	        printf "$(C_Y)    · 镜像超出内存区域 → linker.ld 的 . 起点/RAM 长度$(C_0)\n"; \
+	    fi; \
+	    if grep -qi 'multiple definition' $(BUILD)/.ld.log; then \
+	        printf "$(C_Y)    · 重复定义 → .h 里写了定义 (漏 static / 漏 guard)$(C_0)\n"; \
+	    fi; \
+	    rm -f $@; exit 1; \
+	fi
+	@printf "$(C_D)        入口: $(C_B)%s$(C_0)   目标: $(C_B)%s$(C_0)\n" \
+	        "$$($(READELF) -h $@ | awk '/Entry point/{print $$NF}')" "$(TARGET)"
+
+# ---- C 编译 ----
+$(BUILD)/%.c.o: %.c
+	$(call act_CC)
+	@mkdir -p $(dir $@)
+	$(Q)$(CC) $(CFLAGS) -c -o $@ $< 2>$(BUILD)/.diag.$$$$.log; \
+	if [ -s $(BUILD)/.diag.$$$$.log ]; then \
+	    printf "$(C_R)  ✗ $<\n$(C_0)"; sed 's/^/    /' $(BUILD)/.diag.$$$$.log; \
+	    printf "$(C_Y)  诊断:$(C_0)\n"; \
+	    if grep -qi 'implicit declaration' $(BUILD)/.diag.$$$$.log; then \
+	        printf "$(C_Y)    · 函数未声明 → 在 .h 补原型 + #include 它$(C_0)\n"; \
+	    fi; \
+	    if grep -qiE 'undeclared identifier|unknown type name' $(BUILD)/.diag.$$$$.log; then \
+	        printf "$(C_Y)    · 标识符未见 → 漏 #include / -I 路径错 / **include guard 写成了 #ifdef?**$(C_0)\n"; \
+	    fi; \
+	    if grep -qiE 'multiple definition|duplicate' $(BUILD)/.diag.$$$$.log; then \
+	        printf "$(C_Y)    · 重复定义 → .h 里写了定义, 或漏 include guard$(C_0)\n"; \
+	    fi; \
+	    if grep -qiE 'logical .*with constant|tautological' $(BUILD)/.diag.$$$$.log; then \
+	        printf "$(C_Y)    · **位操作误用 &&** → 寄存器位域一律用 & | ~$(C_0)\n"; \
+	    fi; \
+	    if grep -qiE 'anonymous struct|expected identifier|stray|missing .* before|syntax error' $(BUILD)/.diag.$$$$.log; then \
+	        printf "$(C_Y)    · 语法错 (struct/括号/分号附近) → 第一个错才是真错, 后面是余震$(C_0)\n"; \
+	        printf "$(C_Y)      高频手滑: 'struct void foo()' / 上一行漏 ;$(C_0)\n"; \
+	    fi; \
+	    if grep -qiE 'misleading.indentation' $(BUILD)/.diag.$$$$.log; then \
+	        printf "$(C_Y)    · 缩进撒谎 → 代码长得像在循环里, 实际不是$(C_0)\n"; \
+	    fi; \
+	    if grep -qiE 'no previous prototype|missing.declarations' $(BUILD)/.diag.$$$$.log; then \
+	        printf "$(C_Y)    · 全局函数无原型 → 建 .h 声明它 (别加 static, 否则链接找不到)$(C_0)\n"; \
+	    fi; \
+	    if grep -qiE 'unused function' $(BUILD)/.diag.$$$$.log; then \
+	        printf "$(C_Y)    · static 函数无人调用 → 放错文件了? 跨文件调用要放 .h + static inline$(C_0)\n"; \
+	    fi; \
+	    printf "$(C_Y)    · (未识别的错类, 以上原文为准)$(C_0)\n"; \
+	    rm -f $(BUILD)/.diag.*.log; exit 1; \
+	fi
+	@rm -f $(BUILD)/.diag.*.log
+
+# ---- 汇编 ----
+$(BUILD)/%.S.o: %.S
+	$(call act_AS)
+	@mkdir -p $(dir $@)
+	$(Q)$(CC) $(ASFLAGS) -c -o $@ $< 2>$(BUILD)/.diag.$$$$.log; \
+	if [ -s $(BUILD)/.diag.$$$$.log ]; then \
+	    printf "$(C_R)  ✗ $<\n$(C_0)"; sed 's/^/    /' $(BUILD)/.diag.$$$$.log; \
+	    printf "$(C_Y)  诊断:$(C_0)\n"; \
+	    if grep -qiE 'unknown mnemonic|unrecognized|bad instruction' $(BUILD)/.diag.$$$$.log; then \
+	        printf "$(C_Y)    · 指令拼错 → 注意 .global(有小数点) / mrs 方向(从系统寄存器读)$(C_0)\n"; \
+	    fi; \
+	    if grep -qiE 'expecting|operand|junk after' $(BUILD)/.diag.$$$$.log; then \
+	        printf "$(C_Y)    · 操作数语法 → 逗号别省: ldr x0, =0x8000$(C_0)\n"; \
+	        printf "$(C_Y)      立即数太大? mov 只吃 16 位, 改 ldr =...$(C_0)\n"; \
+	        printf "$(C_Y)      后缀大写? 汇编文件必须 .S (过 cpp), 不是 .s$(C_0)\n"; \
+	    fi; \
+	    if grep -qiE 'alignment|align' $(BUILD)/.diag.$$$$.log; then \
+	        printf "$(C_Y)    · 对齐伪操作 → .align N 在 aarch64 是 2^N 字节, 别当 N 字节用$(C_0)\n"; \
+	    fi; \
+	    rm -f $(BUILD)/.diag.*.log; exit 1; \
+	fi
+	@rm -f $(BUILD)/.diag.*.log
+#===============================================================================
+#  7. 诊断命令
+#===============================================================================
+.PHONY: doctor
+doctor:
+	@printf "$(C_B)$(BOLD)▸ adhesive v$(ADHESIVE_VERSION) 环境自检$(C_0)\n"
+	@for t in $(TOOLS); do \
+	    if command -v $$t >/dev/null 2>&1; then \
+	        printf "$(C_G)  ✓ %-20s$(C_0) $(C_D)%s$(C_0)\n" "$$t" "$$($$t --version 2>&1 | head -1 | cut -c1-50)"; \
+	    else \
+	        printf "$(C_R)  ✗ %-20s$(C_0) 未找到$(C_0)\n" "$$t"; \
+	        case $$t in \
+	            *clang)  printf "$(C_Y)      pkg install clang$(C_0)\n";; \
+	            ld.lld|*llvm-*) printf "$(C_Y)      pkg install lld$(C_0)\n";; \
+	        esac; \
+	    fi; \
+	done
+	@if command -v $(QEMU) >/dev/null 2>&1; then \
+	    printf "$(C_G)  ✓ %-20s$(C_0) $(C_D)%s$(C_0)\n" "$(QEMU)" "$$($(QEMU) --version 2>&1 | head -1)"; \
+	else printf "$(C_R)  ✗ %-20s$(C_0) → pkg install qemu-system-aarch64$(C_0)\n" "$(QEMU)"; fi
+	@printf "$(C_B)▸ triple 验证$(C_0)\n"
+	@mkdir -p $(BUILD); printf 'int __probe;\n' > $(BUILD)/.probe.c
+	@if $(CC) --target=$(TARGET) -ffreestanding -c -o $(BUILD)/.probe.o $(BUILD)/.probe.c 2>/dev/null; then \
+	    printf "$(C_G)  ✓ --target=$(TARGET) 可用$(C_0)\n"; \
+	else printf "$(C_R)  ✗ --target=$(TARGET) 编译失败$(C_0)\n"; fi
+	@rm -f $(BUILD)/.probe.c $(BUILD)/.probe.o
+	@printf "$(C_B)▸ 项目结构$(C_0)\n"
+	@for d in $(SRC_DIRS_C) $(SRC_DIRS_S) $(INC_DIRS); do \
+	    [ -d $$d ] && printf "$(C_G)  ✓ %s/$(C_0)\n" $$d || printf "$(C_Y)  ! %s/ 不存在$(C_0)\n" $$d; done
+	@[ -f $(LINKER) ] && printf "$(C_G)  ✓ %s$(C_0)\n" $(LINKER) || printf "$(C_R)  ✗ %s 缺失$(C_0)\n" $(LINKER)
+	@printf "$(C_B)▸ 手滑扫描$(C_0)\n"
+	@h=$$(grep -rn '^#ifdef CATALYST' include/ 2>/dev/null | wc -l); \
+	 [ "$$h" -gt 0 ] && { printf "$(C_R)  ✗ %s 处 #ifdef 用作 guard (应 #ifndef):$(C_0)\n" $$h; grep -rn '^#ifdef CATALYST' include/ | sed 's/^/      /'; } \
+	 || printf "$(C_G)  ✓ include guard 全部 #ifndef$(C_0)\n"
+	@h=$$(grep -rnE '\b(el|val|sctlr|spsr|hcr|scr|reg|esr|far)\w*\s*>>[^;]*&&' kernel/ include/ 2>/dev/null | wc -l); \
+	 [ "$$h" -gt 0 ] && { printf "$(C_Y)  ! %s 处疑似位域用 && (应 &):$(C_0)\n" $$h; grep -rnE '\b(el|val|sctlr|spsr|hcr|scr|reg|esr|far)\w*\s*>>[^;]*&&' kernel/ include/ | sed 's/^/      /'; } \
+	 || printf "$(C_G)  ✓ 位域未见 && 误用$(C_0)\n"
+
+# ---- 为什么我的文件没被编进来? ----
+.PHONY: why
+why:
+	@printf "$(C_B)$(BOLD)▸ 源文件发现诊断$(C_0)\n"
+	@printf "$(C_D)  扫描目录: C=%s  S=%s$(C_0)\n" "$(SRC_DIRS_C)" "$(SRC_DIRS_S)"
+	@printf "$(C_D)  已发现 %s 个:$(C_0)\n" "$(words $(SRCS))"
+	@$(foreach s,$(SRCS),printf "    $(C_G)✓$(C_0) %s\n" $(s);)
+	@printf "$(C_Y)  常见原因:$(C_0)\n"
+	@printf "$(C_Y)    · 文件在扫描目录外 → make SRC_DIRS_C+=\"新目录\"$(C_0)\n"
+	@printf "$(C_Y)    · 后缀 .s 小写 → 汇编必须 .S 大写 (要过 cpp)$(C_0)\n"
+	@printf "$(C_Y)    · 被 EXCLUDE 排除了 → make EXCLUDE=$(C_0)\n"
+
+.PHONY: tree
+tree:
+	@printf "$(C_B)$(BOLD)▸ 源文件 → 产物 映射 (%s 个)$(C_0)\n" "$(words $(OBJS))"
+	@$(foreach o,$(OBJS),printf "  $(C_D)%-40s$(C_0)→ $(C_M)%s$(C_0)\n" $(patsubst $(BUILD)/%.o,%,$(o)) $(o);)
+
+.PHONY: size
+size: $(ELF)
+	@printf "$(C_B)$(BOLD)▸ 体积报告$(C_0)\n"
+	@$(SIZE) -A $(ELF) 2>/dev/null | sed 's/^/  /' || $(SIZE) $(ELF) | sed 's/^/  /'
+	@printf "  $(C_D)ELF 总: %s 字节$(C_0)\n" "$$(stat -c %s $(ELF))"
+
+.PHONY: check
+check: $(ELF)
+	@printf "$(C_B)$(BOLD)▸ 验尸报告: $(ELF)$(C_0)\n"
+	@e=$$($(READELF) -h $(ELF) | awk '/Entry point/{print $$NF}'); \
+	 printf "  入口: $(C_B)0x%s$(C_0)  " $$e; \
+	 case $$e in 0000000040000000) printf "$(C_G)✓$(C_0)\n";; *) printf "$(C_R)✗ 期望 0x40000000 (-T 没生效?)$(C_0)\n";; esac
+	@printf "\n  $(C_D)段布局:$(C_0)\n"
+	@$(READELF) -S $(ELF) | awk '/\.text|\.rodata|\.data|\.bss|\.vectors/{printf "    %-16s %-12s addr=%s size=%s\n",$$2,$$3,$$5,$$6}'
+	@printf "\n  $(C_D)2KB 对齐检查 (2B 向量表要用):$(C_0)\n"
+	@$(NM) -n $(ELF) 2>/dev/null | grep -iE 'exception_vectors|_start|kernel_main' | while read a t n; do \
+	    lo=$$((0x$$a & 2047)); \
+	    if [ "$$lo" = 0 ]; then printf "    $(C_G)✓$(C_0) %-20s 0x%s  (2KB 对齐 ✓)\n" "$$n" "$$a"; \
+	    else printf "    $(C_R)✗$(C_0) %-20s 0x%s  低 11 位 = %d  ← 不对齐!\n" "$$n" "$$a" "$$lo"; fi; \
+	 done
+	@printf "\n  $(C_D)前 8 符号:$(C_0)\n"
+	@$(NM) -n $(ELF) | head -8 | sed 's/^/    /'
+
+# ---- tags: 让 editors 能跳转 ----
+.PHONY: tags
+tags:
+	@if command -v ctags >/dev/null 2>&1; then \
+	    ctags -R --fields=+iaS --extra=+q $(SRC_DIRS_C) $(SRC_DIRS_S) $(INC_DIRS) && \
+	    printf "$(C_G)✓ tags 已生成$(C_0)\n"; \
+	else printf "$(C_Y)! ctags 未安装: pkg install universal-ctags$(C_0)\n"; fi
+#===============================================================================
+#  8. 运行与清理
+#===============================================================================
+.PHONY: run
+run: $(ELF)
+	$(call act_QEMU)
+	@printf "$(C_D)──────────────────────────────────────────────$(C_0)\n"
+	$(Q) $(QEMU) $(QEMUFLAGS) $(ELF); rc=$$?; \
+	printf "$(C_D)──────────────────────────────────────────────$(C_0)\n"; \
+	if [ $$rc -eq 0 ]; then printf "$(C_G)✓ QEMU 正常退出$(C_0)\n"; \
+	else \
+	    printf "$(C_R)✗ QEMU 退出码 $$rc$(C_0)\n"; \
+	    printf "$(C_Y)  · 137 = SIGKILL (Termux 内存压力, 关掉后台再试)$(C_0)\n"; \
+	    printf "$(C_Y)  · 屏幕全黑 → make check 先看入口地址$(C_0)\n"; \
+	    printf "$(C_Y)  · 入口对但全黑 → boot.S 的 _start 没跳进 kernel_main$(C_0)\n"; \
+	    printf "$(C_Y)  · 乱码 → UART 状态位没查 (FR_TXFF) / 波特率未配$(C_0)\n"; \
+	    printf "$(C_Y)  · 打印后卡死 → 正常, for(;;) 在干活; Ctrl+A 松手 X 退出$(C_0)\n"; \
+	fi
+
+.PHONY: bin
+bin: $(ELF)
+	$(call act_GEN)
+	$(Q)$(OBJCOPY) -O binary $< $(BIN)
+	@printf "  $(C_D)%s 字节$(C_0)\n" "$$(stat -c %s $(BIN))"
+
+.PHONY: clean
+clean:
+	$(Q)rm -rf $(BUILD)
+	@printf "$(C_G)✓ 已清理 $(BUILD)/$(C_0)\n"
+
+# mrproper: Linux 术语, 连 tags/cscope/编辑器垃圾一起清
+.PHONY: mrproper
+mrproper: clean
+	$(Q)rm -f tags cscope.* .ccls-cache -r 2>/dev/null; $(RM) *~
+	@printf "$(C_G)✓ 彻底清扫 (含 tags / 备份文件)$(C_0)\n"
+
+.PHONY: help
+help:
+	@printf "$(C_B)$(BOLD)adhesive v$(ADHESIVE_VERSION) — CatalystOS 构建粘合剂$(C_0)\n"
+	@printf "  $(C_M)make$(C_0)            构建 catalyst.elf (静默)\n"
+	@printf "  $(C_M)make V=1$(C_0)        显示完整命令\n"
+	@printf "  $(C_M)make -jN$(C_0)        N 路并行 (默认串行排错)\n"
+	@printf "  $(C_M)make doctor$(C_0)     环境自检 + 手滑扫描\n"
+	@printf "  $(C_M)make tree$(C_0)       源文件→产物映射\n"
+	@printf "  $(C_M)make why$(C_0)        诊断文件为何没被编进来\n"
+	@printf "  $(C_M)make check$(C_0)      验尸: 入口/段/2KB 对齐/符号\n"
+	@printf "  $(C_M)make size$(C_0)       体积报告\n"
+	@printf "  $(C_M)make run$(C_0)        构建 + QEMU\n"
+	@printf "  $(C_M)make tags$(C_0)       生成 ctags 索引\n"
+	@printf "  $(C_M)make clean$(C_0)      清 build/\n"
+	@printf "  $(C_M)make mrproper$(C_0)   连 tags 一起清 (Linux 术语)\n"
+	@printf "\n  $(C_D)覆盖参数示例:$(C_0)\n"
+	@printf "    make CC=clang-21 TARGET=aarch64-unknown-none\n"
+	@printf "    make SRC_DIRS_C=\"kernel drivers\" EXCLUDE=\"drivers/broken.c\"\n"
+	@printf "    make CFLAGS+=-DDEBUG QEMUFLAGS+=\"-d int,cpu_reset\"\n"
+
+#---- 头文件依赖跟踪 (必须在 OBJS 之后) ----
+-include $(DEPS)
+
+
+
