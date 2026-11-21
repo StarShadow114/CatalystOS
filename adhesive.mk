@@ -402,3 +402,72 @@ help:
 -include $(DEPS)
 
 endif # ADHESIVE_INCLUDED
+
+#===============================================================================
+#  知识库引擎 — 读 doc/errors.txt, 匹配诊断
+#  新增报错只改 doc/errors.txt, 不动本文件
+#===============================================================================
+ERR_DB ?= doc/errors.txt
+
+# 单条查询: $(call kb_match,层,日志内容)  →  打印匹配到的诊断
+#   $1 = 层 (C/AS/LD/QEMU)
+#   $2 = 日志文件
+#   返回: 命中的条目数 (供调用方判断是否要走"未知"分支)
+define kb_match
+$(shell \
+  log="$2"; [ -s "$$log" ] || exit 0; \
+  db="$(ERR_DB)"; [ -f "$$db" ] || exit 0; \
+  hit=0; \
+  awk -F' \\|\\| ' '/^[A-Za-z]+ \|\[\|/ {print}' "$$db" | while IFS='|' read -r layer pat rest; do \
+      :; \
+  done; \
+  awk -v want="$1" -F' \\|\\| ' ' \
+      BEGIN { pat=""; doc=""; on=0 } \
+      /^[A-Za-z]+ \|\| / { \
+          if (on && pat != "" && doc != "") print pat "\x01" doc; \
+          split($$0, a, " \\|\\| "); \
+          if (a[1] == want) { pat=a[3]; doc=""; on=1 } else { on=0; pat="" } \
+          next \
+      } \
+      /^  / || /^\t/ { if (on) doc = doc "\n" $$0; next } \
+      { if (on) doc = doc "\n" $$0 } \
+      END { if (on && pat != "" && doc != "") print pat "\x01" doc } \
+  ' "$$db" | while IFS=$$'\1' read -r pat doc; do \
+      if grep -qiE "$$pat" "$$log" 2>/dev/null; then \
+          printf '\033[33m  诊断:\033[0m\n'; \
+          printf '%s\n' "$$doc" | sed 's/^/    /'; \
+      fi; \
+  done; \
+  printf 'x'  \
+)
+endef
+
+.PHONY: kb-test
+kb-test:
+	@printf "$(C_B)▸ 知识库自检: $(ERR_DB)$(C_0)\n"
+	@if [ ! -f $(ERR_DB) ]; then \
+	    printf "$(C_R)  ✗ %s 不存在$(C_0)\n" "$(ERR_DB)"; exit 1; \
+	 fi
+	@printf "  条目: $(C_G)%s$(C_0) 条\n" "$$(grep -c '^[A-Za-z]* || ' $(ERR_DB))"
+	@printf "  按层: $(C_D)%s$(C_0)\n" "$$(grep -oE '^[A-Za-z]+ \|\| ' $(ERR_DB) | awk '{print $$1}' | sort | uniq -c | tr '\n' ' ')"
+	@printf "\n  $(C_D)自检: 每条的正则能编过 egrep 吗$(C_0)\n"
+	@bad=0; awk -F' \\|\\| ' '/^[A-Za-z]+ \|\| / {print $$1": "$$3}' $(ERR_DB) | while read -r line; do \
+	    pat=$$(echo "$$line" | cut -d: -f2- | sed 's/^ //'); \
+	    if ! echo "test" | grep -qiE "$$pat" 2>/dev/null; then \
+	        printf "$(C_R)  ✗ 正则非法: %s$(C_0)\n" "$$line" | cut -c1-100; \
+	    fi; \
+	 done; printf "$(C_G)  ✓ 正则语法全通过$(C_0)\n"
+	@printf "\n  $(C_D)试用: 拿一条已知报错喂它$(C_0)\n"
+	@printf 'kernel/x.c:1: error: no previous prototype for function bridge\n' > $(BUILD)/.kbtest
+	@$(call kb_match,C,$(BUILD)/.kbtest)
+	@rm -f $(BUILD)/.kbtest
+
+.PHONY: kb-add
+kb-add:
+	@printf "$(C_B)▸ 追加一条知识库记录$(C_0)\n"
+	@printf "  用法: make kb-add L=C P='正则' D='第一行诊断' D2='续行'(可选)\n"
+	@if [ -z "$(P)" ] || [ -z "$(D)" ]; then printf "$(C_Y)  L/P/D 都不能空$(C_0)\n"; exit 1; fi
+	@printf '$(L) || $(P) || $(D)\n' >> $(ERR_DB)
+	@if [ -n "$(D2)" ]; then printf '  $(D2)\n' >> $(ERR_DB); fi
+	@printf "$(C_G)  ✓ 已追加到 $(ERR_DB) 末尾 (第 %s 条)$(C_0)\n" "$$(grep -c '^[A-Za-z]* || ' $(ERR_DB))"
+	@tail -3 $(ERR_DB) | sed 's/^/    /'

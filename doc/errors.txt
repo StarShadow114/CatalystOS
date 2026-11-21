@@ -1,0 +1,210 @@
+#===============================================================================
+#  CatalystOS 报错知识库 — adhesive doctor / 编译诊断 的数据源
+#
+#  格式 (三列, 用 ' || ' 分隔, 空格敏感):
+#     层 || 正则(egrep) || 诊断文本
+#
+#  层:
+#     C      = C 编译期 stderr
+#     AS     = 汇编期 stderr
+#     LD     = 链接期 stderr
+#     QEMU   = 运行时输出 / 退出码
+#     STATIC = 源码静态扫描 (grep 源码, 不是编译输出)
+#
+#  规则:
+#   1. 正则用 egrep 语法, 别加分隔符, 别锚定 (默认部分匹配, 大小写不敏感)
+#   2. 诊断文本里要换行就再写一行, 以 '  ' (两空格) 开头 = 续行
+#   3. 以 '#' 开头或空行 = 注释
+#   4. 新坑问出来之后, 往【文件末尾】追加, 别插中间 (保持时间顺序)
+#   5. 模式写宽一点没关系 (误报只是多一句提示), 写窄了就漏
+#
+#  未知报错会打印:
+#     ? 未收录: <原文前 120 字符>
+#       → 问元宝, 然后把答案追加到 doc/errors.txt 末尾
+#===============================================================================
+
+#-------------------------------------------------------------------------------
+# C 编译期
+#-------------------------------------------------------------------------------
+C || fatal error:.*file not found || 头文件找不到
+  → 路径拼错? (arch 打成 aech 这种, 你栽过)
+  → 文件真不存在? ls 确认
+  → 尖括号走 -Iinclude; 双引号先找 .c 同目录
+  → .S 要大写才会过 cpp
+
+C || macro redefined || 宏重定义
+  → 一个常量只能有一个家. grep -rn '#define XXX' include/
+  → 拆法: 纯常量进 mmio.h / asm_macros.h (C 和 .S 通吃), 带声明的留 uart.h (仅 C)
+
+C || no previous prototype || 全局函数缺头文件原型
+  → 建 xxx.h 声明它. 别听 clang 说加 static:
+    static 让符号不进符号表, 链接期 undefined symbol (被汇编调用的函数尤其)
+
+C || implicit declaration || 函数未声明就被调用 (C99 起是 error)
+  → 在 .h 补原型 + #include 它
+
+C || undeclared identifier \| unknown type name || 标识符/类型未见, 三选一
+  1) 漏 #include
+  2) -I 路径不对
+  3) include guard 写成 #ifdef 了 (静默吞掉整个头文件)
+  验证: clang -Iinclude -E file.c | grep -c <标识符>
+
+C || redefinition \| previous definition || 重复定义
+  → .h 里写了函数体? 漏 include guard? 漏 static?
+
+C || logical .*with constant \| tautological \| always evaluates to true || ★ 位操作误用 && / ||
+  → 寄存器位域一律 & | ~
+  → && 的结果只有 0/1, 两边非零则恒真 → 死循环且零提示
+
+C || anonymous struct \| expected identifier \| expected .* before \| stray \| syntax error || 语法错
+  → 高频手滑: 'struct void foo()' / 上一行漏 ; / 引号不成对
+  → ★ 第一个错才是真错, 后面全是余震, 从最上面修
+
+C || misleading indentation || 缩进撒谎
+  → 代码看着在循环/if 里, 实际不在. 空循环体的 ';' 独占一行且缩进比 while 深一级
+
+C || unused function \| unused variable || static 函数/变量无人用
+  → 放错文件了. 跨文件调用要 .h + static inline, 且必须真被 include
+
+C || incompatible pointer \| makes pointer \| makes integer || 指针/整数混用
+  → 回想 '0'(整数48) vs "0"(地址) 那个坑
+
+C || fallthrough || switch 穿透
+  → 每个 case 末尾要 break, 或写 /* fallthrough */
+
+C || division by zero \| shift.*exceed \| overflow in constant || 常量算术错
+  → 移位量超出位宽? 除数为 0?
+
+C || constraint \| operand.*asm \| asm.*operand || 内联汇编约束写法错
+  → mrs: "mrs %0, CurrentEL" : "=r"(v)
+  → msr: "msr CurrentEL, %0" : : "r"(v) : "memory"
+  → 碰系统寄存器几乎总要 "memory" clobber (编译器屏障)
+
+#-------------------------------------------------------------------------------
+# 汇编期
+#-------------------------------------------------------------------------------
+AS || unknown mnemonic \| unrecognized \| bad instruction || 指令/伪操作拼错
+  → 1) 'global _start' 漏点 → 必须 '.global'
+  → 2) mrs 方向: mrs Xt, SysReg (目标寄存器在前)
+  → 3) ★ 汇编器常把拼错的词当【标号】静默吞掉, 不报错只错下去
+
+AS || unknown directive || 伪操作拼错
+  → .section 打成 .sectiom 之类 (你栽过)
+
+AS || expecting \| operand \| junk after \| comma || 操作数语法
+  → 逗号别省: ldr x0, =0x8000
+  → ★ ldr 不吃 # ; mov 不吃 >16 位立即数
+  → 口诀: mov 配 #, ldr 配 =, 取地址用 adr 或 ldr =
+
+AS || expected identifier || .equ 左值不是标识符
+  → ★ 九成是 #define 和 .equ 撞名了: cpp 把左值也替换成数字
+  → 查: 那个名字在 include/ 里是不是已有 #define
+
+AS || expected compatible register or logical immediate || 立即数装不下
+  → mov 只吃 16 位. 改 ldr x0, =0x...
+
+AS || expected label or encodable || ldr 用了 # 立即数
+  → ldr x0, =0xdead0001 (等号!) 或 mov x0, #0x1234
+
+AS || too few operands || 指令缺操作数
+  → msr SPSR_EL3, x0 (别漏 , x0)
+
+AS || expected writable system register || 系统寄存器名拼错
+  → SCR 打成 SRC 这种 (你栽过). 查 ARM ARM 的寄存器拼写
+
+AS || align || 对齐伪操作
+  → aarch64 上 .align N = 2^N 字节. 向量表要 2KB → .align 11
+  → 差一位全盘崩且零提示. 验: make check 看低 11 位
+
+AS || already defined \| redefined || 符号重复定义
+  → 两个 .S 都写了 _start? .global 放错位置?
+
+AS || unexpected token in argument list || ★ C 声明混进了 .S
+  → .S 只许 include 纯宏头文件 (asm_macros.h / mmio.h)
+  → 含 void/static/struct/函数声明的 (uart.h/sysregs.h/trap.h) 一律会炸
+  → 你在这个坑栽过 2 次, 记住判据: 头文件里有 void 就不能进 .S
+
+#-------------------------------------------------------------------------------
+# 链接期
+#-------------------------------------------------------------------------------
+LD || undefined symbol || 未解析符号
+  → 看 lld 的 'did you mean' (编辑距离算出来的, 有就是拼错, 30 秒改完)
+  → 没近似项 = 真缺实现: 补 .c / 补 .global / 查 make why 文件被扫到了吗
+  → 函数加了 static 却想跨文件用? .global 丢了小数点?
+  → ★ 汇编报不出这个错: 它只记账不认识别的文件, 非得等链接
+
+LD || multiple definition || 重复定义
+  → .h 里写了函数体? 漏 include guard? 漏 static?
+
+LD || not aligned \| alignment || 段对齐冲突
+  → linker.ld 里 .text.boot 是否 KEEP 且排第一? 向量表 .align 11?
+
+LD || overflow \| region .* full \| out of memory \| exceeds || 镜像超内存区域
+  → linker.ld 的 . 起点 / RAM LENGTH. 查 make size 看哪个段涨爆
+
+LD || cannot find \| no such file || 找不到文件/脚本
+  → -T arch/aarch64/linker.ld 路径对吗
+
+LD || entry symbol \| _start || 入口符号缺失
+  → boot.S 的 '.global _start' 有小数点吗
+
+#-------------------------------------------------------------------------------
+# 运行时 (QEMU)
+#-------------------------------------------------------------------------------
+QEMU || exit 137 \| SIGKILL || QEMU 被杀
+  → Termux 内存压力, 关后台再试
+
+QEMU || blackscreen || 全黑, 一个字都没有 (按序排查)
+  1) make check 看入口是不是 0x40000000 (不是 = -T 没生效, 用了默认脚本 0x10000)
+  2) _start 没跳到 kernel_main (bl 目标拼错)
+  3) ★ VBAR_EL1=0 → 异常跳地址 0, 静默死
+  4) ★ HCR_EL2.RW 漏设 → eret 掉进 AArch32, 连报错都没有
+  5) 串口: tbz 位号错 (#5=TXFF) / UART0_FR 地址错
+  深挖: make trace, grep -E 'Exception|AArch32|Taking'
+
+QEMU || AArch32 || ★ 掉进 32 位世界
+  → HCR_EL2.RW (bit31) 没设上. 这是 EL2→EL1 的头号死因
+
+QEMU || 乱码 \| 方块 || UART 未初始化 / FR_TXFF 状态位查错
+  → tbz w2,#5 (TXFF), 写成 #4 (RXFE) 就丢字符
+
+QEMU || 只打.*半句 \| 打印完.*停 || 后面那条指令触发异常
+  → 看最后打印的字符定位, 然后 make disasm FN=... 对照 ELR
+
+#-------------------------------------------------------------------------------
+# 静态扫描 (grep 源码, 编译之前)
+#-------------------------------------------------------------------------------
+STATIC || ^#ifdef CATALYST || ★ include guard 写成 #ifdef
+  → 必须 #ifndef. 症状: 整个头文件被静默吞掉, 报一堆 undeclared
+
+STATIC || struct void || 'struct void' 手滑
+
+STATIC || putc(" || putc 用了双引号
+  → 传的是指针不是字符. putc('x') 单引号
+
+STATIC || \\\$ || ★ 反斜杠后面跟了空白, 续行符失效
+  → 宏展开缺 }, 报错落在八百里外. 把 \ 后面的空格全删掉
+
+STATIC || drop_form \| aech \| sectiom \| kernle \| incldue \| retrun || 手写拼写手滑
+
+STATIC || EMPTY_FILE || 空源文件
+  → 编成空 .o 全程不报错. 要么写内容要么删掉
+
+#-------------------------------------------------------------------------------
+# 2B 硬件层: 这些 toolchain 一个字都不会说, 只能靠 make check
+#-------------------------------------------------------------------------------
+LD || VBAR_ALIGN || ★ 向量表未 2KB 对齐
+  → .align 11 写成 10 了. 地址末 3 位 hex 必须是 000 或 800
+  → 后果: 异常来了跳野地址, 黑屏, 零提示
+
+LD || HCR_RW_CLOBBER || ★ HCR_EL2.RW 被后续 mov x0,#0 覆盖
+  → 寄存器复用冲突. SCTLR 那段换 x1, 别碰 x0
+  → 验: llvm-objdump -d | grep -c 'msr hcr_el2' 必须 == 1
+QEMU || vec : 0x00000010 || ★ vec=0x10 = 组1 SYNC from EL0, 但你没建用户态
+QEMU || FATAL TRAP.*
+.*FATAL TRAP.*
+.*FATAL TRAP || ★ 异常横幅无限刷屏 = handler 返回了
+QEMU || ^CatalystOS.*
+.*(CurrentEL|VBAR) || banner 打全了但后面刷屏: VBAR 装成功, 死在第一次异常的处理路径上
+C || call to undeclared function || ★ C99 起禁止隐式声明: 调用点出现在定义之前
+C || static declaration of .* follows non-static declaration || 这个错几乎是 "call to undeclared function" 的影子, 别当两个 bug 修

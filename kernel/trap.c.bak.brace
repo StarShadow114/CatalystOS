@@ -1,0 +1,337 @@
+/*
+ * kernel/trap.c — AArch64 异常分发 (stage 2B)
+ *
+ * ★ 结构纪律 (每一条都是今晚炸过一次换来的):
+ *
+ *  1. 【异常路径零外部依赖】
+ *     所有输出走 raw_* (内联汇编直撸 PL011), 不调 uart.c 的任何函数.
+ *     因为 uart_* 隐含 "init 跑过 / 全局标志有效 / 栈可用 / 无重入" 四个前提,
+ *     而异常可以在这四个前提全不成立时发生.
+ *
+ *  2. 【static 函数一律在顶部声明区登记】
+ *     C99 禁隐式声明. 不登记则函数定义顺序变成隐式约束:
+ *     调在前 + 定义在後 → "call to undeclared function", 且若真定义带
+ *     static 会连带报 "static declaration follows non-static declaration".
+ *
+ *  3. 【★ 声明归属: 互补, 不重叠】
+ *     调用者只在本文件  → static + 本文件的声明区
+ *     调用者超出本文件  → trap.h 登记, 【绝不再进本声明区】
+ *     同一个函数两处声明且链接属性不同 = 硬错. 今晚栽过一次.
+ *
+ *  4. 【2B 阶段所有 handler 必须 noreturn】
+ *     eret 会回到那条出错指令; 2B 没有任何修复逻辑, 返回 = 必然再炸 = 刷屏.
+ *     三道保险: __attribute__((noreturn)) [编译期]
+ *             + for(;;)wfi            [运行期 C 内]
+ *             + vectors.S 的 adr x30  [运行期汇编, 物理兜底]
+ *     2C 加了 trapframe + ELR+=4 之后才允许返回.
+ */
+
+#include <kernel/trap.h>
+#include <arch/aarch64/mmio.h>
+
+/*══════════════════════════════════════════════════════════════════════
+ * 内部函数前向声明区 —— 只放【本文件私有】的 static 函数
+ *
+ *  ⚠ trap_dump_raw 不在此列: 它已在 include/kernel/trap.h 里登记为
+ *     全局接口 (外部链接). 再在这里写 static 就是自相矛盾.
+ *
+ *  自查命令 (5 行必须互补, 任何一行两边同时 ≥1 就是错):
+ *    for f in raw_putc raw_puts raw_hex32 raw_hex64 trap_dump_raw; do
+ *      echo "$f .c=$(grep -c "static void $f(" kernel/trap.c) .h=$(grep -c "\b$f\b" include/kernel/trap.h)"
+ *    done
+ *════════════════════════════════════════════════════════════════════ */
+static void raw_putc(char c);
+static void raw_puts(const char *s);
+static void raw_hex32(unsigned int v);
+static void raw_hex64(unsigned long v);
+static const char *vec_name(unsigned int vec);
+static const char *ec_name(unsigned int ec);
+static const char *dfsc_name(unsigned int dfsc);
+
+/*──────────────────────────────────────────────────────────────────────
+ * 异常计数器: 分辨"刷屏"是 handler 返回了, 还是被反复触发
+ *   [seq] trap #1 只一次 = handler 吊死成功 ✓
+ *   [seq] trap #2,#3... = 有路径跑出去了 ✗
+ * 放 .data (有初值), 不依赖 .bss 清零.
+ *──────────────────────────────────────────────────────────────────── */
+static volatile unsigned int g_trap_seq;
+
+/*══════════════════════════════════════════════════════════════════════
+ * 一、异常路径专用输出 —— 内联汇编直撸 PL011, 零依赖
+ *
+ *  为什么不用 uart.c: 见文件头纪律 1.
+ *  为什么可重入: 不用全局状态、不用锁、不碰栈; 只用 w2 并在 clobber 声明,
+ *                不踩 C 的寄存器分配. 嵌套异常也能打.
+ *  为什么 volatile: 否则 -O2 可能把轮询循环优化掉.
+ *════════════════════════════════════════════════════════════════════ */
+static void raw_putc(char c)
+{
+    __asm__ volatile (
+        "1:  ldr  w2, [%0]            \n"
+        "    tbz  w2, #5, 2f          \n"   /* bit5 = TXFF; 0 = FIFO 有空位 */
+        "    b    1b                  \n"
+        "2:  strb %w1, [%2]           \n"
+        : : "r"((unsigned long)UART0_FR),
+            "r"((unsigned long)(unsigned char)c),
+            "r"((unsigned long)UART0_DR)
+        : "w2", "memory"
+    );
+}
+
+static void raw_puts(const char *s)
+{
+    while (*s) { raw_putc(*s); s++; }
+}
+
+/* 32 位: 8 次循环, 一位一组. 定义在 hex64 之前 —— 它被 hex64 调用 */
+static void raw_hex32(unsigned int v)
+{
+    static const char hex[] = "0123456789abcdef";
+    int i;
+    for (i = 28; i >= 0; i -= 4)
+        raw_putc(hex[(v >> i) & 0xF]);
+}
+
+/* 64 位: 拆两次 32 位调用, 避开 16 次循环里的 %w 修饰符细节 */
+static void raw_hex64(unsigned long v)
+{
+    raw_puts("0x");
+    raw_hex32((unsigned int)(v >> 32));
+    raw_hex32((unsigned int)(v & 0xffffffff));
+}
+
+/*══════════════════════════════════════════════════════════════════════
+ * 二、查表: 把数字翻译成人话
+ *   ★ 这三张表是横幅能打出 "Data Abort, same EL" 的唯一来源.
+ *     覆盖文件时漏掉它们 = 炸了但看不懂.
+ *   ★ 全部 static + const, 留在 .rodata, 不占栈.
+ *════════════════════════════════════════════════════════════════════ */
+static const char *vec_name(unsigned int vec)
+{
+    switch (vec) {
+    case 0x000: return "SYNC  from EL1h (SP_EL1)";
+    case 0x080: return "IRQ   from EL1h (SP_EL1)";
+    case 0x100: return "FIQ   from EL1h (SP_EL1)";
+    case 0x180: return "SERROR from EL1h (SP_EL1)";
+    case 0x200: return "SYNC  from EL0 (AArch64)";
+    case 0x280: return "IRQ   from EL0 (AArch64)";
+    case 0x300: return "FIQ   from EL0 (AArch64)";
+    case 0x380: return "SERROR from EL0 (AArch64)";
+    default:    break;
+    }
+    }
+    return "?? unknown vector";
+}
+
+static const char *ec_name(unsigned int ec)
+{
+    switch (ec) {
+    case 0x00: return "Unknown";
+    case 0x01: return "Trapped WFI/WFE";
+    case 0x03: return "Trapped MRS, CP15";
+    case 0x07: return "Access SVE/SIMD/FP";
+    case 0x0E: return "Illegal Execution state   ★";
+    case 0x11: return "SVC (AArch32)";
+    case 0x15: return "SVC (AArch64)";
+    case 0x18: return "Trapped MSR, CP15";
+    case 0x1E: return "Trapped instruction";
+    case 0x20: return "Instruction Abort, lower EL";
+    case 0x21: return "Instruction Abort, same EL  ★";
+    case 0x22: return "PC alignment fault          ★ PSTATE.M 垃圾的典型症状";
+    case 0x24: return "Data Abort, lower EL";
+    case 0x25: return "Data Abort, same EL         ★ 页表不存在/地址非法";
+    case 0x26: return "SP alignment fault          ★ SP 未 16 字节对齐";
+    case 0x28: return "Trapped FP exception (AArch32)";
+    case 0x2A: return "Trapped FP exception (AArch64)";
+    case 0x2C: return "SError (async, precise)";
+    case 0x2D: return "SError (async, imprecise)";
+    case 0x2E: return "SError (async, imprecise from lower EL)";
+    case 0x30: return "Breakpoint (lower EL, AArch32)";
+    case 0x31: return "Breakpoint (lower EL, AArch64)  ← 2C 的断点";
+    case 0x32: return "Breakpoint (same EL)";
+    case 0x34: return "Software Step (lower EL)";
+    case 0x35: return "Software Step (same EL)";
+    case 0x38: return "Watchpoint (lower EL)";
+    case 0x39: return "Watchpoint (same EL)";
+    case 0x3A: return "BKPT (AArch32)";
+    case 0x3C: return "BRK  (AArch64)              ← 2C 的断点";
+    case 0x3D: return "DCPS1";
+    case 0x3E: return "DCPS2";
+    case 0x3F: return "DCPS0";
+    default:   return "?? reserved";
+    }
+}
+
+static const char *dfsc_name(unsigned int dfsc)
+{
+    switch (dfsc & 0x3F) {
+    case 0x00: return "Address size fault, L0";
+    case 0x01: return "Address size fault, L1";
+    case 0x02: return "Address size fault, L2";
+    case 0x03: return "Address size fault, L3";
+    case 0x04: return "Translation fault, L0   ★ 该级页表项全 0 (2B 的常态)";
+    case 0x05: return "Translation fault, L1";
+    case 0x06: return "Translation fault, L2";
+    case 0x07: return "Translation fault, L3";
+    case 0x09: return "Access flag fault, L0";
+    case 0x0A: return "Access flag fault, L1";
+    case 0x0B: return "Access flag fault, L2";
+    case 0x0C: return "Access flag fault, L3";
+    case 0x0D: return "Permission fault, L0";
+    case 0x0E: return "Permission fault, L1";
+    case 0x0F: return "Permission fault, L2";
+    case 0x10: return "Permission fault, L3   ← 页表有了但权限不对 (2D 常客)";
+    case 0x11: return "Synchronous external abort";
+    case 0x15: return "Synchronous external abort on translation table walk";
+    case 0x18: return "Synchronous parity/ECC error";
+    case 0x1C: return "Synchronous parity/ECC error on translation table walk";
+    case 0x21: return "Alignment fault";
+    case 0x23: return "Unsupported atomic/exclusive";
+    case 0x24: return "Tag check fault (L0)";
+    case 0x25: return "Tag check fault (L1)";
+    case 0x26: return "Tag check fault (L2)";
+    case 0x27: return "Tag check fault (L3)";
+    case 0x2A: return "Address size fault, TT walk (L0)";
+    case 0x2B: return "Address size fault, TT walk (L1-3)";
+    case 0x2C: return "Address size fault, TT walk (L2)";
+    case 0x2D: return "Address size fault, TT walk (L3)";
+    case 0x35: return "Access flag fault, TT walk (L0)";
+    case 0x36: return "Access flag fault, TT walk (L1)";
+    case 0x37: return "Access flag fault, TT walk (L2)";
+    case 0x38: return "Access flag fault, TT walk (L3)";
+    case 0x39: return "Permission fault, TT walk (L0)";
+    case 0x3A: return "Permission fault, TT walk (L1)";
+    case 0x3B: return "Permission fault, TT walk (L2)";
+    case 0x3C: return "Permission fault, TT walk (L3)";
+    default:   return "?? reserved FSC";
+    }
+}
+
+/*══════════════════════════════════════════════════════════════════════
+ * 三、裸诊断 —— 最先打, 不做任何假设
+ *
+ *  为什么存在: 横幅里的 ESR/ELR/FAR 曾整整两轮一行都打不出来.
+ *     根因不是 uart_hex64 炸了, 是 trap_dump_raw 压根没被调用
+ *     (sed 的 \s 非 POSIX → 静默替换 0 处).
+ *  为什么走 raw_*: 见纪律 1.
+ *  为什么打 CurrentEL 和 SPSR: 分辨 "软件以为在 EL1" vs "硬件记录 EL0"
+ *     —— vec=0x10 与 CurrentEL=1 的矛盾, 只有 SPSR.M 能裁决.
+ *════════════════════════════════════════════════════════════════════ */
+void trap_dump_raw(unsigned int vec)
+{
+    unsigned long esr, elr, far, spsr, cur;
+
+    __asm__ volatile ("mrs %0, ESR_EL1  " : "=r"(esr));
+    __asm__ volatile ("mrs %0, ELR_EL1  " : "=r"(elr));
+    __asm__ volatile ("mrs %0, FAR_EL1  " : "=r"(far));
+    __asm__ volatile ("mrs %0, SPSR_EL1 " : "=r"(spsr));
+    __asm__ volatile ("mrs %0, CurrentEL" : "=r"(cur));
+
+    raw_puts("\r\n[raw] vec=");        raw_hex32(vec);
+    raw_puts("  CurrentEL=");          raw_hex32((unsigned int)(cur >> 2));
+    raw_puts("\r\n[raw] ESR=");        raw_hex64(esr);
+    raw_puts("  EC=");                 raw_hex32((unsigned int)(esr >> 26));
+    raw_puts("\r\n[raw] ELR=");        raw_hex64(elr);
+    raw_puts("\r\n[raw] FAR=");        raw_hex64(far);
+    raw_puts("\r\n[raw] SPSR=");       raw_hex64(spsr);
+    raw_puts("  M=");                  raw_hex32((unsigned int)(spsr & 0xF));
+    raw_puts("\r\n");
+}
+
+/*══════════════════════════════════════════════════════════════════════
+ * 四、分发核心 —— 2B 阶段: 打印后吊死, 绝不返回
+ *════════════════════════════════════════════════════════════════════ */
+__attribute__((noreturn)) void trap_entry(unsigned int vec)
+{
+    unsigned long esr, elr, far, spsr;
+
+    g_trap_seq++;
+    raw_puts("\r\n[seq] trap #"); raw_hex32(g_trap_seq); raw_puts("\r\n");
+
+    /* ★ 第一步就裸打寄存器 —— 哪怕后面全炸, 这四个数也已经在串口上了 */
+    trap_dump_raw(vec);
+
+    __asm__ volatile ("mrs %0, ESR_EL1 " : "=r"(esr));
+    __asm__ volatile ("mrs %0, ELR_EL1 " : "=r"(elr));
+    __asm__ volatile ("mrs %0, FAR_EL1 " : "=r"(far));
+    __asm__ volatile ("mrs %0, SPSR_EL1" : "=r"(spsr));
+
+    raw_puts("\r\n════════ FATAL TRAP ════════\r\n");
+    raw_puts("vec : "); raw_hex64(vec);  raw_puts("  "); raw_puts(vec_name(vec));
+    raw_puts("\r\nESR : "); raw_hex64(esr);
+    raw_puts("\r\nELR : "); raw_hex64(elr);
+    raw_puts("   (← 用 `make disasm FN=kernel_main` 对到具体指令)");
+    raw_puts("\r\nFAR : "); raw_hex64(far);
+    raw_puts("\r\nSPSR: "); raw_hex64(spsr);
+    raw_puts("   M["); raw_hex32((unsigned int)(spsr & 0xF));
+    raw_puts("] = ");
+    raw_puts((spsr & 0xF) == 0x5 ? "EL1h ✓"
+           : (spsr & 0xF) == 0x0 ? "EL0t ✗ PSTATE 摆位失败"
+           :                        "?? 异常值");
+    raw_puts("\r\n");
+
+    if ((esr >> 26) == 0x25 || (esr >> 26) == 0x21 || (esr >> 26) == 0x24) {
+        raw_puts("EC  : "); raw_hex32((unsigned int)(esr >> 26));
+        raw_puts("  ");     raw_puts(ec_name((unsigned int)(esr >> 26)));
+        raw_puts("\r\nDFSC: "); raw_hex32((unsigned int)(esr & 0x3F));
+        raw_puts("  ");     raw_puts(dfsc_name((unsigned int)(esr & 0x3F)));
+        raw_puts("\r\n");
+    } else {
+        raw_puts("EC  : "); raw_hex32((unsigned int)(esr >> 26));
+        raw_puts("  ");     raw_puts(ec_name((unsigned int)(esr >> 26)));
+        raw_puts("\r\n");
+    }
+
+    raw_puts("════════════════════════════\r\n");
+    raw_puts("2B 阶段不返回: eret 会回到 ELR 那条指令, 无修复逻辑必然再炸.\r\n");
+    raw_puts("2C 加 trapframe + ELR+=4 后才允许返回.\r\n\r\n");
+
+    for (;;) { __asm__ volatile ("wfi"); }   /* ★ 纪律 4: 保险之一 */
+}
+
+/*──────────────────────────────────────────────────────────────────────
+ * 各向量入口 —— vectors.S 用 b 跳进来 (不是 bl), x30 是脏的.
+ *   汇编侧另有 adr x30, vector_trap_return 作为物理兜底.
+ *──────────────────────────────────────────────────────────────────── */
+__attribute__((noreturn)) void trap_from_el0_sync(unsigned int vec)
+{
+    raw_puts("\r\n!!! SYNC from EL0 — 内核还没建用户态, 不该走到这儿 !!!\r\n");
+    raw_puts("!!! 若 CurrentEL=1 却取到组1向量, 说明 PSTATE.M 是复位残值 !!!\r\n");
+    trap_entry(vec);
+}
+
+__attribute__((noreturn)) void trap_from_el0(unsigned int vec)
+{
+    raw_puts("\r\n!!! 异常来自 EL0, 但内核还没建用户态 !!!\r\n");
+    trap_entry(vec);
+}
+
+__attribute__((noreturn)) void trap_bad_sp(unsigned int vec)
+{
+    raw_puts("\r\n!!! SP 配置错误 / 疑似掉进 AArch32 !!!\r\n");
+    trap_entry(vec);
+}
+
+__attribute__((noreturn)) void trap_sync_el1(unsigned int vec)
+{
+    /* 2B 只诊断; 2C 起这里接 BRK/SVC, 改 ELR 后 eret 返回 */
+    trap_entry(vec);
+}
+
+__attribute__((noreturn)) void trap_irq_el1(unsigned int vec)
+{
+    raw_puts("\r\n[irq] EL1h IRQ (2B 未接 GIC, 吊死)\r\n");
+    trap_entry(vec);
+}
+
+__attribute__((noreturn)) void trap_fiq_el1(unsigned int vec)
+{
+    raw_puts("\r\n[fiq] EL1h FIQ (2B 未接, 吊死)\r\n");
+    trap_entry(vec);
+}
+
+__attribute__((noreturn)) void trap_serror_el1(unsigned int vec)
+{
+    raw_puts("\r\n[serror] EL1h SError — 通常是总线/设备配置错误, 最凶的一种\r\n");
+    trap_entry(vec);
+}

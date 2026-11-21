@@ -1,0 +1,201 @@
+#include <kernel/trap.h>
+#include <kernel/uart.h>
+#include <arch/aarch64/sysregs.h>
+
+/*===========================================================================
+ * 异常总入口
+ *
+ * 现状: 裸打印版 —— 不保存 trapframe, 打印完直接 for(;;)wfi 吊死.
+ *       所以"任何异常都是致命的", 这是 2B 的预期行为.
+ * 2C:   补 struct trapframe + eret 返回, 异常变成可恢复.
+ *
+ * 调用约定: vectors.S 用 b 跳进来 (不是 bl!), x0 = 向量号.
+ *          因为不是 bl, x30(返回地址)无效 —— 这函数永不返回.
+ *=========================================================================*/
+
+static void put_hex4(unsigned int v)
+{
+    static const char hex[] = "0123456789abcdef";
+    int i;
+    for (i = 28; i >= 0; i -= 4)
+        uart_putc(hex[(v >> i) & 0xF]);
+}
+
+static void put_ec(unsigned int ec)
+{
+    uart_putc('0');
+    put_hex4(ec);
+}
+
+static const char *vec_name(unsigned int v)
+{
+    switch (v) {
+    case 0x00: return "SYNC  from EL1h (SP_EL1)";
+    case 0x01: return "IRQ   from EL1h";
+    case 0x02: return "FIQ   from EL1h";
+    case 0x03: return "SERR  from EL1h";
+    case 0x10: return "SYNC  from EL0 (AArch64)";
+    case 0x11: return "IRQ   from EL0";
+    case 0x12: return "FIQ   from EL0";
+    case 0x13: return "SERR  from EL0";
+    case 0x20: return "SYNC  from EL1h (SP_EL0)";
+    case 0x21: return "IRQ   from EL1h (SP_EL0)";
+    case 0x30: return "SYNC  from EL0 (AArch32)";
+    default:   return "???";
+    }
+}
+
+static const char *ec_name(unsigned int ec)
+{
+    switch (ec) {
+    case EC_UNKNOWN:       return "Unknown reason";
+    case EC_WFI_WFE:       return "WFI/WFE trap";
+    case EC_SVC_64:        return "SVC (AArch64) — 系统调用";
+    case EC_HVC_64:        return "HVC (AArch64)";
+    case EC_IABORT_LOWER:  return "Instr Abort from lower EL";
+    case EC_IABORT_CUREL:  return "Instr Abort, same EL";
+    case EC_PC_ALIGN:      return "PC alignment fault";
+    case EC_DABORT_LOWER:  return "Data Abort from lower EL";
+    case EC_DABORT_CUREL:  return "Data Abort, same EL ★";
+    case EC_SP_ALIGN:      return "SP alignment fault (16B?)";
+    case EC_FP_TRAP:       return "FP/SIMD trap (CPACR/CPTR?)";
+    case EC_SERROR:        return "SError (async abort)";
+    case EC_BRK:           return "BRK (software breakpoint)";
+    default:               return "*** 未知 EC — 查 ARM ARM D7 ***";
+    }
+}
+
+/* 数据中止的 ISS 里 DFSC (bit[5:0]) 说明原因 */
+static const char *dfsc_name(unsigned int iss)
+{
+    switch (iss & 0x3F) {
+    case 0x00: return "Address size fault, L0";
+    case 0x01: return "Address size fault, L1";
+    case 0x02: return "Address size fault, L2";
+    case 0x03: return "Address size fault, L3";
+    case 0x04: return "Translation fault, L0  ← 页表不存在";
+    case 0x05: return "Translation fault, L1";
+    case 0x06: return "Translation fault, L2";
+    case 0x07: return "Translation fault, L3";
+    case 0x09: return "Access flag fault, L1";
+    case 0x0B: return "Access flag fault, L3";
+    case 0x0C: return "Permission fault, L0";
+    case 0x0D: return "Permission fault, L1";
+    case 0x0E: return "Permission fault, L2";
+    case 0x0F: return "Permission fault, L3  ← 权限不够";
+    case 0x10: return "Sync External Abort (非 MMU 侧)";
+    case 0x11: return "Alignment fault  ← 地址没对齐且 SCTLR.A=1";
+    case 0x21: return "Write to RO  ← 写只读页";
+    case 0x23: return "Exec on XN   ← 执行不可执行页";
+    default:   return "其他/保留";
+    }
+}
+
+void trap_entry(unsigned int vec)
+{
+    unsigned long esr = read_sysreg(ESR_EL1);
+    unsigned long elr = read_sysreg(ELR_EL1);
+    unsigned long far = read_sysreg(FAR_EL1);
+    unsigned long spsr = read_sysreg(SPSR_EL1);
+    unsigned int  ec  = esr_ec(esr);
+    unsigned int  iss = (unsigned int)(esr & ESR_ISS);
+
+    uart_puts("\r\n");
+    uart_puts("════════ FATAL TRAP ════════\r\n");
+    uart_puts("vec : 0x"); put_hex4(vec);
+    uart_puts("  "); uart_puts(vec_name(vec));   uart_puts("\r\n");
+    uart_puts("ESR : 0x"); uart_hex64(esr);      uart_puts("\r\n");
+    uart_puts("ELR : 0x"); uart_hex64(elr);
+    uart_puts("   ← 出错指令地址 (反汇编: make disasm FN=...)\r\n");
+    uart_puts("FAR : 0x"); uart_hex64(far);
+    uart_puts("   ← 出错访问地址\r\n");
+    uart_puts("EC  : 0x"); put_ec(ec);
+    uart_puts("  "); uart_puts(ec_name(ec));     uart_puts("\r\n");
+    if (ec == EC_DABORT_CUREL || ec == EC_DABORT_LOWER) {
+        uart_puts("DFSC: 0x"); put_hex4(iss & 0x3F);
+        uart_puts("  "); uart_puts(dfsc_name(iss)); uart_puts("\r\n");
+    }
+    uart_puts("ISS : 0x"); put_hex4(iss);        uart_puts("\r\n");
+    uart_puts("SPSR: 0x"); uart_hex64(spsr);     uart_puts("\r\n");
+    uart_puts("════════════════════════════\r\n");
+
+    for (;;) { asm volatile ("wfi"); }   /* 绝不返回: 返回=回到出错指令=死循环 */
+}
+
+void trap_from_el0(unsigned int vec)
+{
+    uart_puts("\r\n!!! 异常来自 EL0, 但内核还没建用户态 !!!\r\n");
+    trap_entry(vec);
+    for (;;) { asm volatile ("wfi"); }   /* trap_entry 若返回, 这儿兜住 */
+}
+
+void trap_bad_sp(unsigned int vec)
+{
+    uart_puts("\r\n!!! SP 配置错误 / AArch32 不支持 !!!\r\n");
+    trap_entry(vec);
+    for (;;) { asm volatile ("wfi"); }
+}
+
+void trap_irq_el1(unsigned int vec)    { trap_entry(vec); }
+void trap_fiq_el1(unsigned int vec)   { trap_entry(vec); }
+void trap_serror_el1(unsigned int vec){ trap_entry(vec); }
+
+/*===========================================================================
+ * 组 0 Sync —— 内核同步异常的主力入口
+ *
+ * 不同于 IRQ/FIQ/SError (异步, 现在只是挂着), Sync 是"指令自己惹的祸",
+ * 必须细分 EC 才知道怎么办. 这里是 2C 的地基: 把"致命"和"可恢复"分开.
+ *=========================================================================*/
+void trap_sync_el1(unsigned int vec)
+{
+    unsigned long esr = read_sysreg(ESR_EL1);
+    unsigned int  ec  = esr_ec(esr);
+
+    switch (ec) {
+    case EC_BRK:
+        /* 软件断点: 2C 会让它单步/继续, 现在先报告 */
+        uart_puts("[sync] BRK — software breakpoint\r\n");
+        break;
+    case EC_SVC_64:
+        /* 系统调用: 3A 的地基. 现在没实现, 不能静默放过 */
+        uart_puts("[sync] SVC — syscall 未实现\r\n");
+        break;
+    case EC_WFI_WFE:
+        /* WFE 被 trap: 有些配置下会来, 可以忽略并跳过指令 */
+        uart_puts("[sync] WFE trap (ignored)\r\n");
+        return;             /* ★ 唯一能返回的一条: 不返回就死循环炸 */
+    case EC_DABORT_CUREL:
+    case EC_IABORT_CUREL:
+        uart_puts("[sync] Abort in kernel — 这是真 bug\r\n");
+        break;
+    default:
+        uart_puts("[sync] 未分类 Sync\r\n");
+        break;
+    }
+
+    /* 除 WFE 外, 剩下的在 2B 一律致命 —— 2C 才改成 eret 返回 */
+    trap_entry(vec);
+}
+
+/* ------------------------------------------------------------------
+ * ★ 诊断加强版: 绕开所有可能炸的路径, 只依赖 put_hex4 (自包含)
+ *   在 trap_entry 开头调用, 把 4 个关键寄存器原样打出来
+ * ---------------------------------------------------------------- */
+__attribute__((used)) void trap_dump_raw(unsigned int vec)
+{
+    unsigned long esr, elr, far, spsr, cur;
+    __asm__ volatile ("mrs %0, ESR_EL1  " : "=r"(esr));
+    __asm__ volatile ("mrs %0, ELR_EL1  " : "=r"(elr));
+    __asm__ volatile ("mrs %0, FAR_EL1  " : "=r"(far));
+    __asm__ volatile ("mrs %0, SPSR_EL1 " : "=r"(spsr));
+    __asm__ volatile ("mrs %0, CurrentEL" : "=r"(cur));
+
+    uart_puts("\r\n[raw] vec=");   put_hex4(vec);
+    uart_puts(" CurrentEL=");      put_hex4((unsigned int)(cur >> 2));
+    uart_puts("\r\n[raw] ESR=");   uart_hex64(esr);
+    uart_puts(" EC=");             put_hex4((unsigned int)(esr >> 26));
+    uart_puts("\r\n[raw] ELR=");   uart_hex64(elr);
+    uart_puts("\r\n[raw] FAR=");   uart_hex64(far);
+    uart_puts("\r\n[raw] SPSR=");  uart_hex64(spsr);
+    uart_puts("\r\n");
+}

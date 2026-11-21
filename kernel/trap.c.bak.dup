@@ -1,0 +1,259 @@
+#include <kernel/trap.h>
+
+/* ★ 异常计数器: 每次进 trap_entry 加一.
+ *   seq=1 只打一次 = 正常; seq=2,3,4... = 反复进 = handler 返回了
+ *   放在 .data 段, 别放 .bss (BSS 清零依赖启动代码, 多一重依赖) */
+static volatile unsigned int g_trap_seq;
+
+#include <kernel/uart.h>
+#include <arch/aarch64/sysregs.h>
+
+/*===========================================================================
+ * 异常总入口
+ *
+ * 现状: 裸打印版 —— 不保存 trapframe, 打印完直接 for(;;)wfi 吊死.
+ *       所以"任何异常都是致命的", 这是 2B 的预期行为.
+ * 2C:   补 struct trapframe + eret 返回, 异常变成可恢复.
+ *
+ * 调用约定: vectors.S 用 b 跳进来 (不是 bl!), x0 = 向量号.
+ *          因为不是 bl, x30(返回地址)无效 —— 这函数永不返回.
+ *=========================================================================*/
+
+
+/*---------------------------------------------------------------------------
+ * ★ 异常路径专用输出: 直接撸 PL011, 零依赖
+ *   不调 uart.c 的任何函数 —— 它们隐含"uart_init 跑过了 / 全局标志是 1 /
+ *   没有锁竞争 / 栈可用" 四个前提, 而异常可以在任何时点发生,
+ *   包括这四个前提全不成立的时候.
+ *   只碰 w2 且在 clobber 声明, 不踩 C 的寄存器分配.
+ *-------------------------------------------------------------------------*/
+static void raw_putc(char c)
+{
+    __asm__ volatile (
+        "1:  ldr  w2, [%0]            \n"
+        "    tbz  w2, #5, 2f          \n"   /* bit5 = TXFF; 0 = FIFO 有空位 */
+        "    b    1b                  \n"
+        "2:  strb %w1, [%2]           \n"
+        : : "r"((unsigned long)UART0_FR),
+            "r"((unsigned long)(unsigned char)c),
+            "r"((unsigned long)UART0_DR)
+        : "w2", "memory"
+    );
+}
+
+static void raw_puts(const char *s)
+{
+    while (*s) { raw_putc(*s); s++; }
+}
+
+static void raw_hex32(unsigned int v)
+{
+    static const char hex[] = "0123456789abcdef";
+    int i;
+    for (i = 28; i >= 0; i -= 4)
+        raw_putc(hex[(v >> i) & 0xF]);
+}
+
+static void raw_hex64(unsigned long v)
+{
+    raw_puts("0x");
+    raw_hex32((unsigned int)(v >> 32));
+    raw_hex32((unsigned int)(v & 0xFFFFFFFFUL));
+}
+
+static void raw_hex32(unsigned int v)
+{
+    static const char hex[] = "0123456789abcdef";
+    int i;
+    for (i = 28; i >= 0; i -= 4)
+        raw_putc(hex[(v >> i) & 0xF]);
+}
+
+static void put_ec(unsigned int ec)
+{
+    raw_putc('0');
+    raw_hex32(ec);
+}
+
+static const char *vec_name(unsigned int v)
+{
+    switch (v) {
+    case 0x00: return "SYNC  from EL1h (SP_EL1)";
+    case 0x01: return "IRQ   from EL1h";
+    case 0x02: return "FIQ   from EL1h";
+    case 0x03: return "SERR  from EL1h";
+    case 0x10: return "SYNC  from EL0 (AArch64)";
+    case 0x11: return "IRQ   from EL0";
+    case 0x12: return "FIQ   from EL0";
+    case 0x13: return "SERR  from EL0";
+    case 0x20: return "SYNC  from EL1h (SP_EL0)";
+    case 0x21: return "IRQ   from EL1h (SP_EL0)";
+    case 0x30: return "SYNC  from EL0 (AArch32)";
+    default:   return "???";
+    }
+}
+
+static const char *ec_name(unsigned int ec)
+{
+    switch (ec) {
+    case EC_UNKNOWN:       return "Unknown reason";
+    case EC_WFI_WFE:       return "WFI/WFE trap";
+    case EC_SVC_64:        return "SVC (AArch64) — 系统调用";
+    case EC_HVC_64:        return "HVC (AArch64)";
+    case EC_IABORT_LOWER:  return "Instr Abort from lower EL";
+    case EC_IABORT_CUREL:  return "Instr Abort, same EL";
+    case EC_PC_ALIGN:      return "PC alignment fault";
+    case EC_DABORT_LOWER:  return "Data Abort from lower EL";
+    case EC_DABORT_CUREL:  return "Data Abort, same EL ★";
+    case EC_SP_ALIGN:      return "SP alignment fault (16B?)";
+    case EC_FP_TRAP:       return "FP/SIMD trap (CPACR/CPTR?)";
+    case EC_SERROR:        return "SError (async abort)";
+    case EC_BRK:           return "BRK (software breakpoint)";
+    default:               return "*** 未知 EC — 查 ARM ARM D7 ***";
+    }
+}
+
+/* 数据中止的 ISS 里 DFSC (bit[5:0]) 说明原因 */
+static const char *dfsc_name(unsigned int iss)
+{
+    switch (iss & 0x3F) {
+    case 0x00: return "Address size fault, L0";
+    case 0x01: return "Address size fault, L1";
+    case 0x02: return "Address size fault, L2";
+    case 0x03: return "Address size fault, L3";
+    case 0x04: return "Translation fault, L0  ← 页表不存在";
+    case 0x05: return "Translation fault, L1";
+    case 0x06: return "Translation fault, L2";
+    case 0x07: return "Translation fault, L3";
+    case 0x09: return "Access flag fault, L1";
+    case 0x0B: return "Access flag fault, L3";
+    case 0x0C: return "Permission fault, L0";
+    case 0x0D: return "Permission fault, L1";
+    case 0x0E: return "Permission fault, L2";
+    case 0x0F: return "Permission fault, L3  ← 权限不够";
+    case 0x10: return "Sync External Abort (非 MMU 侧)";
+    case 0x11: return "Alignment fault  ← 地址没对齐且 SCTLR.A=1";
+    case 0x21: return "Write to RO  ← 写只读页";
+    case 0x23: return "Exec on XN   ← 执行不可执行页";
+    default:   return "其他/保留";
+    }
+}
+
+void trap_entry(unsigned int vec){
+    g_trap_seq++;
+    raw_puts("\r\n[seq] trap #"); raw_hex32(g_trap_seq); raw_puts("\r\n");
+    trap_dump_raw(vec);   /* ★ 最先打, 不做任何假设 */
+    unsigned long esr = read_sysreg(ESR_EL1);
+    unsigned long elr = read_sysreg(ELR_EL1);
+    unsigned long far = read_sysreg(FAR_EL1);
+    unsigned long spsr = read_sysreg(SPSR_EL1);
+    unsigned int  ec  = esr_ec(esr);
+    unsigned int  iss = (unsigned int)(esr & ESR_ISS);
+
+    raw_puts("\r\n");
+    raw_puts("════════ FATAL TRAP ════════\r\n");
+    raw_puts("vec : 0x"); raw_hex32(vec);
+    raw_puts("  "); raw_puts(vec_name(vec));   raw_puts("\r\n");
+    raw_puts("ESR : 0x"); raw_hex64(esr);      raw_puts("\r\n");
+    raw_puts("ELR : 0x"); raw_hex64(elr);
+    raw_puts("   ← 出错指令地址 (反汇编: make disasm FN=...)\r\n");
+    raw_puts("FAR : 0x"); raw_hex64(far);
+    raw_puts("   ← 出错访问地址\r\n");
+    raw_puts("EC  : 0x"); put_ec(ec);
+    raw_puts("  "); raw_puts(ec_name(ec));     raw_puts("\r\n");
+    if (ec == EC_DABORT_CUREL || ec == EC_DABORT_LOWER) {
+        raw_puts("DFSC: 0x"); raw_hex32(iss & 0x3F);
+        raw_puts("  "); raw_puts(dfsc_name(iss)); raw_puts("\r\n");
+    }
+    raw_puts("ISS : 0x"); raw_hex32(iss);        raw_puts("\r\n");
+    raw_puts("SPSR: 0x"); raw_hex64(spsr);     raw_puts("\r\n");
+    raw_puts("════════════════════════════\r\n");
+
+    for (;;) { asm volatile ("wfi"); }   /* 绝不返回: 返回=回到出错指令=死循环 */
+}
+
+void trap_from_el0(unsigned int vec)
+{
+    raw_puts("\r\n!!! 异常来自 EL0, 但内核还没建用户态 !!!\r\n");
+    trap_entry(vec);
+    for (;;) { asm volatile ("wfi"); }   /* trap_entry 若返回, 这儿兜住 */
+}
+
+void trap_bad_sp(unsigned int vec)
+{
+    raw_puts("\r\n!!! SP 配置错误 / AArch32 不支持 !!!\r\n");
+    trap_entry(vec);
+    for (;;) { asm volatile ("wfi"); }
+}
+
+void trap_irq_el1(unsigned int vec)    { trap_entry(vec); }
+void trap_fiq_el1(unsigned int vec)   { trap_entry(vec); }
+void trap_serror_el1(unsigned int vec){ trap_entry(vec); }
+
+/*===========================================================================
+ * 组 0 Sync —— 内核同步异常的主力入口
+ *
+ * 不同于 IRQ/FIQ/SError (异步, 现在只是挂着), Sync 是"指令自己惹的祸",
+ * 必须细分 EC 才知道怎么办. 这里是 2C 的地基: 把"致命"和"可恢复"分开.
+ *=========================================================================*/
+void trap_sync_el1(unsigned int vec)
+{
+    unsigned long esr = read_sysreg(ESR_EL1);
+    unsigned int  ec  = esr_ec(esr);
+
+    switch (ec) {
+    case EC_BRK:
+        /* 软件断点: 2C 会让它单步/继续, 现在先报告 */
+        raw_puts("[sync] BRK — software breakpoint\r\n");
+        break;
+    case EC_SVC_64:
+        /* 系统调用: 3A 的地基. 现在没实现, 不能静默放过 */
+        raw_puts("[sync] SVC — syscall 未实现\r\n");
+        break;
+    case EC_WFI_WFE:
+        /* WFE 被 trap: 有些配置下会来, 可以忽略并跳过指令 */
+        raw_puts("[sync] WFE trap (ignored)\r\n");
+        return;             /* ★ 唯一能返回的一条: 不返回就死循环炸 */
+    case EC_DABORT_CUREL:
+    case EC_IABORT_CUREL:
+        raw_puts("[sync] Abort in kernel — 这是真 bug\r\n");
+        break;
+    default:
+        raw_puts("[sync] 未分类 Sync\r\n");
+        break;
+    }
+
+    /* 除 WFE 外, 剩下的在 2B 一律致命 —— 2C 才改成 eret 返回 */
+    trap_entry(vec);
+}
+
+/* ------------------------------------------------------------------
+ * ★ 诊断加强版: 绕开所有可能炸的路径, 只依赖 put_hex4 (自包含)
+ *   在 trap_entry 开头调用, 把 4 个关键寄存器原样打出来
+ * ---------------------------------------------------------------- */
+__attribute__((used)) void trap_dump_raw(unsigned int vec)
+{
+    unsigned long esr, elr, far, spsr, cur;
+    __asm__ volatile ("mrs %0, ESR_EL1  " : "=r"(esr));
+    __asm__ volatile ("mrs %0, ELR_EL1  " : "=r"(elr));
+    __asm__ volatile ("mrs %0, FAR_EL1  " : "=r"(far));
+    __asm__ volatile ("mrs %0, SPSR_EL1 " : "=r"(spsr));
+    __asm__ volatile ("mrs %0, CurrentEL" : "=r"(cur));
+
+    raw_puts("\r\n[raw] vec=");   raw_hex32(vec);
+    raw_puts(" CurrentEL=");      raw_hex32((unsigned int)(cur >> 2));
+    raw_puts("\r\n[raw] ESR=");   raw_hex64(esr);
+    raw_puts(" EC=");             raw_hex32((unsigned int)(esr >> 26));
+    raw_puts("\r\n[raw] ELR=");   raw_hex64(elr);
+    raw_puts("\r\n[raw] FAR=");   raw_hex64(far);
+    raw_puts("\r\n[raw] SPSR=");  raw_hex64(spsr);
+    raw_puts("\r\n");
+}
+
+/* 组 1 Sync (来自 EL0): 2B 还没建用户态, 但这是最该打印 диагностics 的一条 */
+__attribute__((noreturn)) void trap_from_el0_sync(unsigned int vec)
+{
+    raw_puts("\r\n!!! SYNC from EL0 — 内核还没建用户态, 不该走到这儿 !!!\r\n");
+    raw_puts("!!! 若 CurrentEL=1 却取到组1向量, 说明 PSTATE.M 是复位残值 !!!\r\n");
+    trap_entry(vec);
+}
